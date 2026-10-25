@@ -222,12 +222,79 @@ const SHARED: &[&str] = &[
     "request-scoped-errors",
 ];
 
+/// The v8 path a legacy path (as [`super::binary`] walks it: a key, or `None` for a list
+/// item, per step) moves to in [`ConfigDocument::from_mapping`]; a v8 path as it is.
+pub(super) fn v8_path<'a>(keys: &[Option<&'a str>]) -> Vec<Option<&'a str>> {
+    let mut out = Vec::with_capacity(keys.len() + 3);
+    match keys {
+        [Some(root), None, rest @ ..] if let Some((_, family)) = FAMILIES.iter().find(|(old, _)| old == root) => {
+            out.extend([Some("api-keys"), Some(*family), None]);
+            match rest.first() {
+                Some(Some("api-key-entries")) if *family == "openai-compatibility" => {
+                    out.push(Some("keys"));
+                    out.extend(&rest[1..]);
+                    return out;
+                }
+                Some(Some(field))
+                    if *family != "openai-compatibility" && *field != "base-url" && !SHARED.contains(field) =>
+                {
+                    out.extend([Some("keys"), None]);
+                }
+                _ => {}
+            }
+            out.extend(rest);
+        }
+        [Some("api-keys"), None, ..] => {
+            out.push(Some("access"));
+            out.extend(keys);
+        }
+        _ => {
+            /// The moves split into steps.
+            static MOVES: std::sync::LazyLock<Vec<(Vec<&str>, Vec<&str>)>> = std::sync::LazyLock::new(|| {
+                PATHS
+                    .iter()
+                    .chain(CLIENT_PATHS)
+                    .chain(SHARED_PATHS)
+                    .chain(SHARED_STRUCTS)
+                    .map(|(old, current)| (old.split('.').collect(), current.split('.').collect()))
+                    .collect()
+            });
+            // Most paths start at a root no move names.
+            let moved = MOVES
+                .iter()
+                .filter(|(old, _)| keys.first() == Some(&Some(old[0])))
+                .filter(|(old, _)| old.len() <= keys.len() && old.iter().zip(keys).all(|(o, k)| *k == Some(*o)))
+                .max_by_key(|(old, _)| old.len());
+            match moved {
+                Some((old, current)) => {
+                    out.extend(current.iter().map(|step| Some(*step)));
+                    out.extend(&keys[old.len()..]);
+                }
+                None => out.extend(keys),
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct ConfigDocument(Value);
 
 impl ConfigDocument {
+    /// The document a write edits and saves: string settings written as plain numbers or
+    /// booleans hold their text ([`super::config_value`]), so a save that re-emits them
+    /// keeps what Go reads.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let mut root = super::yaml_value(text)?;
+        Self::read(super::config_value(text)?, text)
+    }
+
+    /// The document a read serves: the file's YAML types ([`super::yaml_value`]), as Go's
+    /// views read the file's nodes (`github-token: 5` reads as the number 5).
+    pub fn view(text: &str) -> anyhow::Result<Self> {
+        Self::read(super::yaml_value(text)?, text)
+    }
+
+    fn read(mut root: Value, text: &str) -> anyhow::Result<Self> {
         // Go migrates the alias-expanded tree (`expandConfigAliases`): an edit next to
         // an inherited setting must keep it rather than shadow the whole mapping.
         super::expand_merges(&mut root)?;
@@ -419,7 +486,7 @@ impl ConfigDocument {
     /// without the legacy fields that a v8 field overrides (presence wins), or `None`
     /// when it has none. A legacy-only document is not migrated.
     pub fn without_conflicts(text: &str) -> anyhow::Result<Option<String>> {
-        let mut raw = super::yaml_value(text)?;
+        let mut raw = super::config_value(text)?;
         super::expand_merges(&mut raw)?;
         let Some(root) = raw.as_mapping_mut() else {
             return Ok(None);
@@ -444,8 +511,11 @@ impl ConfigDocument {
     /// block values at the root); anything the syntax tree cannot express falls back
     /// to a full block re-emit that keeps the head comment only.
     pub fn render_preserving(&self, original: &str) -> anyhow::Result<String> {
+        // A number a JSON body set in a string setting reads back as its text.
+        let mut expected = self.0.clone();
+        super::binary::as_reread(&mut expected);
         if let Some(text) = self.try_render(original)
-            && super::yaml_value(&text).ok().as_ref() == Some(&self.0)
+            && super::config_value(&text).ok().as_ref() == Some(&expected)
         {
             return Ok(text);
         }
@@ -457,7 +527,7 @@ impl ConfigDocument {
         for (key, value) in self.0.as_mapping().context("config must be a mapping")? {
             text = super::text::append_root(&text, key.as_str().context("config keys must be strings")?, value);
         }
-        if super::yaml_value(&text)? != self.0 {
+        if super::config_value(&text)? != expected {
             bail!("edited YAML did not round-trip");
         }
         Ok(text)
@@ -471,7 +541,7 @@ impl ConfigDocument {
         };
         let doc = file.document()?;
         let root = doc.as_mapping()?;
-        let before = match super::yaml_value(original).ok()? {
+        let before = match super::config_value(original).ok()? {
             Value::Null => Value::Mapping(Mapping::new()),
             v => v,
         };
@@ -1121,6 +1191,28 @@ mod tests {
         let text = doc.render_preserving(original).unwrap();
         assert_eq!(serde_yaml_ng::from_str::<Value>(&text).unwrap(), *doc.value(), "{text}");
         assert!(text.starts_with("# keep\n") && !text.contains('{'), "{text}");
+    }
+
+    /// A write that re-emits a migrated legacy section keeps the text of a string setting
+    /// written as a number (`0x1F`, not 31), and a read still sees its YAML type, as in Go.
+    #[test]
+    fn writes_keep_string_settings_written_as_numbers() {
+        let original = "oauth-model-alias: {codex: [{name: 0x1F, alias: a}]}\nrouting: {strategy: round-robin}\n";
+        let mut doc = ConfigDocument::parse(original).unwrap();
+        doc.update(&["routing", "strategy"], Value::from("fill-first"), false)
+            .unwrap();
+        let text = doc.render_preserving(original).unwrap();
+        let cfg = crate::config::Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.document["oauth"]["model-alias"]["codex"][0]["name"],
+            Value::from("0x1F"),
+            "{text}"
+        );
+        let view = ConfigDocument::view(original).unwrap();
+        assert_eq!(
+            view.value()["oauth"]["model-alias"]["codex"][0]["name"],
+            Value::from(31)
+        );
     }
 
     #[test]
