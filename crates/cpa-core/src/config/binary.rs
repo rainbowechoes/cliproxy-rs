@@ -367,17 +367,36 @@ fn events_with(text: &str, mut plain: Option<&mut Vec<Plain>>) -> anyhow::Result
                     let value = std::slice::from_raw_parts(s.value, s.length as usize);
                     // The event's span starts at an anchor or tag, so the scalar is the
                     // source bytes that equal its value. One folded over lines
-                    // (`2001-12-14\n  21:59:43`) is not its source; without an anchor or
-                    // tag its event spans just the scalar.
+                    // (`2001-12-14\n  21:59:43`) is not its source: an untagged one starts
+                    // at the event, or after its `&anchor` and the blanks, line breaks
+                    // (NEL, LS and PS too, as libyaml reads them) and comments after it.
                     let end = event.end_mark.index as usize + bom;
                     let timestamp = bytes(s.tag).is_some_and(|t| t == super::timestamp::TAG.as_bytes());
+                    let folded_start = || {
+                        let anchor = bytes(s.anchor).map_or(0, |a| 1 + a.len());
+                        let after = event.start_mark.index as usize + bom + anchor;
+                        let rest = text.get(after..end)?;
+                        let mut comment = false;
+                        let skipped = rest
+                            .char_indices()
+                            .find(|&(_, c)| {
+                                let line_break = matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}');
+                                if line_break {
+                                    comment = false;
+                                } else if c == '#' {
+                                    comment = true;
+                                }
+                                !(comment || line_break || matches!(c, ' ' | '\t'))
+                            })
+                            .map(|(i, _)| i)?;
+                        let first = after + skipped;
+                        (text.as_bytes().get(first) == value.first()).then_some(first)
+                    };
                     let span = end
                         .checked_sub(value.len())
                         .filter(|&start| text.as_bytes().get(start..end) == Some(value))
-                        .map(|start| start..end)
-                        .or_else(|| {
-                            (s.anchor.is_null() && s.tag.is_null()).then(|| event.start_mark.index as usize + bom..end)
-                        });
+                        .or_else(|| s.tag.is_null().then(folded_start).flatten())
+                        .map(|start| start..end);
                     if let Some(plain) = plain.as_deref_mut()
                         && s.style == unsafe_libyaml::YAML_PLAIN_SCALAR_STYLE
                         && (s.tag.is_null() || timestamp)
