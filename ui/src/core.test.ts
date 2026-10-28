@@ -93,13 +93,38 @@ test("usage events keep display fields only and summarise by model", () => {
     tokens: { input_tokens: 10, output_tokens: 5 },
   };
   const e = cleanEvent(raw);
-  assert.deepEqual(Object.keys(e).sort(), ["at", "auth", "failed", "id", "input", "latency", "model", "output", "provider", "status", "ttft"]);
+  assert.deepEqual(Object.keys(e).sort(), [
+    "at",
+    "auth",
+    "cache",
+    "failed",
+    "id",
+    "input",
+    "latency",
+    "model",
+    "output",
+    "provider",
+    "status",
+    "ttft",
+  ]);
   assert.equal(JSON.stringify(e).includes("secret"), false);
   assert.deepEqual([e.model, e.status, e.at], ["daily", 529, Date.parse(raw.timestamp)]);
   const s = usageStats([e, cleanEvent({ model: "m", latency_ms: 0 }), cleanEvent({ model: "m", latency_ms: 300, ttft_ms: 0 })]);
   assert.deepEqual([s.count, s.failed, s.latency, s.ttft], [3, 1, 100, 40]);
   assert.deepEqual(s.models.map((m) => [m.model, m.count]), [["m", 2], ["daily", 1]]);
   assert.equal(usageStats([]).latency, null);
+});
+
+test("cache hit rate counts only requests that report a cache", () => {
+  const cached = cleanEvent({ model: "m", tokens: { input_tokens: 1000, cache_read_tokens: 900, cache_read_tokens_present: true } });
+  const plain = cleanEvent({ model: "m", tokens: { input_tokens: 500 } });
+  const none = cleanEvent({ model: "n", tokens: { input_tokens: 500, cache_read_tokens: 0, cache_read_tokens_present: true } });
+  assert.deepEqual([cached.cache, plain.cache, none.cache], [900, null, 0]);
+  const s = usageStats([cached, plain, none]);
+  assert.deepEqual([s.cached, s.cacheInput, s.hit], [900, 1500, 60]);
+  assert.deepEqual(s.models.map((m) => [m.model, m.hit]), [["m", 90], ["n", 0]]);
+  // A provider that never reports a cache is unknown, not a 0% hit.
+  assert.deepEqual([usageStats([plain]).hit, usageStats([plain]).models[0].hit], [null, null]);
 });
 
 test("quota is percent used, not remaining; unknown payloads stay empty", () => {

@@ -50,6 +50,9 @@
     }),
   );
   const fmt = (n: number | null, unit = "") => (n === null ? "—" : `${n.toLocaleString()}${unit}`);
+  const pct = (n: number | null) => (n === null ? "—" : `${n.toFixed(1)}%`);
+  // A tab can hold millions of tokens; the exact count is in the legend under the number.
+  const compact = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format;
   const time = (t: number) => new Date(t).toLocaleTimeString([], { hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 </script>
 
@@ -90,19 +93,20 @@
     <p class="muted">
       {live
         ? "Listening for requests…"
-        : "Model, latency and tokens per request, kept in this tab only."}
+        : "Model, latency, tokens and cache hits per request, kept in this tab only."}
     </p>
   {:else}
     <div class="window display live-readings">
       <div class="reading"><span class="legend">Requests</span><strong>{fmt(stats.count)}</strong><span class="legend">{stats.failed} failed</span></div>
       <div class="reading"><span class="legend">Median latency</span><strong>{fmt(stats.latency)}<small>&nbsp;ms</small></strong><span class="legend">first token {fmt(stats.ttft, " ms")}</span></div>
-      <div class="reading"><span class="legend">Tokens</span><strong>{fmt(stats.input + stats.output)}</strong><span class="legend">{fmt(stats.input)} in · {fmt(stats.output)} out</span></div>
+      <div class="reading"><span class="legend">Tokens</span><strong>{compact(stats.input + stats.output)}</strong><span class="legend">{fmt(stats.input)} in · {fmt(stats.output)} out</span></div>
+      <div class="reading"><span class="legend">Cache hit</span><strong>{stats.hit === null ? "—" : stats.hit.toFixed(1)}{#if stats.hit !== null}<small>&nbsp;%</small>{/if}</strong><span class="legend">{stats.cacheInput ? `${fmt(stats.cached)} of ${fmt(stats.cacheInput)} in` : "Not reported"}</span></div>
     </div>
     <ul class="list">
-      <li class="item usage-model legend" aria-hidden="true"><span>Model</span><span class="count">Requests</span><span class="count">Failed</span><span class="count">Tokens</span></li>
+      <li class="item usage-model legend" aria-hidden="true"><span>Model</span><span class="count">Requests</span><span class="count">Failed</span><span class="count">Tokens</span><span class="count">Cached</span></li>
       {#each stats.models as m (m.model)}
         <li class="item usage-model">
-          <code class="ellipsis">{m.model}</code><span class="num count">{m.count}</span><span class="num count">{m.failed || ""}</span><span class="num count">{(m.input + m.output).toLocaleString()}</span>
+          <code class="ellipsis">{m.model}</code><span class="num count">{m.count}</span><span class="num count">{m.failed || ""}</span><span class="num count">{(m.input + m.output).toLocaleString()}</span><span class="num count">{pct(m.hit)}</span>
         </li>
       {/each}
     </ul>

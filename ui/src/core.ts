@@ -188,6 +188,7 @@ export type Event = {
   id: string;
   input: number;
   output: number;
+  cache: number | null;
 };
 export function cleanEvent(raw: Data): Event {
   const t = Date.parse(String(raw.timestamp));
@@ -203,22 +204,37 @@ export function cleanEvent(raw: Data): Event {
     id: String(raw.request_id || ""),
     input: Number(raw.tokens?.input_tokens) || 0,
     output: Number(raw.tokens?.output_tokens) || 0,
+    // Cache reads are a subset of input tokens. A record without the flag (a provider
+    // that reports no prompt cache) is null, so it never counts as a 0% hit.
+    cache: raw.tokens?.cache_read_tokens_present === true ? Number(raw.tokens?.cache_read_tokens) || 0 : null,
   };
 }
 const median = (v: number[]) => {
   const s = v.filter((n) => n > 0).sort((a, b) => a - b);
   return s.length ? s[Math.floor((s.length - 1) / 2)] : null;
 };
+const hit = (cached: number, input: number) => (input > 0 ? (cached * 100) / input : null);
 export function usageStats(events: Event[]) {
-  const models = new Map<string, { model: string; count: number; failed: number; input: number; output: number }>();
+  const models = new Map<
+    string,
+    { model: string; count: number; failed: number; input: number; output: number; cached: number; cacheInput: number }
+  >();
   for (const e of events) {
-    const m = models.get(e.model) || { model: e.model, count: 0, failed: 0, input: 0, output: 0 };
+    const m = models.get(e.model) || { model: e.model, count: 0, failed: 0, input: 0, output: 0, cached: 0, cacheInput: 0 };
     m.count++;
     m.failed += +e.failed;
     m.input += e.input;
     m.output += e.output;
+    if (e.cache !== null) {
+      m.cached += e.cache;
+      m.cacheInput += e.input;
+    }
     models.set(e.model, m);
   }
+  const cached = sum(events.map((e) => e.cache ?? 0));
+  // Only requests that reported a cache make up the denominator, so the rate is a hit
+  // rate rather than a share of traffic from providers that never report one.
+  const cacheInput = sum(events.filter((e) => e.cache !== null).map((e) => e.input));
   return {
     count: events.length,
     failed: events.filter((e) => e.failed).length,
@@ -226,7 +242,10 @@ export function usageStats(events: Event[]) {
     ttft: median(events.map((e) => e.ttft)),
     input: sum(events.map((e) => e.input)),
     output: sum(events.map((e) => e.output)),
-    models: [...models.values()].sort((a, b) => b.count - a.count),
+    cached,
+    cacheInput,
+    hit: hit(cached, cacheInput),
+    models: [...models.values()].map((m) => ({ ...m, hit: hit(m.cached, m.cacheInput) })).sort((a, b) => b.count - a.count),
   };
 }
 
